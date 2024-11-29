@@ -81,6 +81,60 @@ public class CrawlerService {
     }
 
     private boolean isValidUrl(String url) {
-        return !url.isEmpty() && !visitedUrls.contains(url);
+        if (url.isEmpty() || visitedUrls.contains(url)) {
+            return false;
+        }
+
+        if (!url.startsWith("http://") && !url.startsWith("https://")) {
+            return false;
+        }
+
+        if (url.contains("javascript:") || url.contains(".onion") || url.startsWith("tel:")) {
+            return false;
+        }
+
+        return true;
     }
+
+    private int calculatePriority(String url) {
+        int priority = 0;
+
+        // Higher priority for main domains
+        if (url.contains("metmuseum.org") || url.contains("nps.gov") || url.contains("mfa.org")) {
+            priority += 10;
+        }
+
+        // Higher priority for specific content types
+        if (url.contains("/exhibitions/") || url.contains("/collections/") || url.contains("/education/")) {
+            priority += 5;
+        }
+
+        // Higher priority for URLs closer to the root
+        int depth = url.split("/").length;
+        priority += (10 - depth);
+
+        return priority;
+    }
+
+    private static class UrlPriority implements Comparable<UrlPriority> {
+        private final String url;
+        private final int priority;
+
+        public UrlPriority(String url, int priority) {
+            this.url = url;
+            this.priority = priority;
+        }
+
+        public String getUrl() {
+            return url;
+        }
+
+        @Override
+        public int compareTo(UrlPriority other) {
+            return Integer.compare(this.priority, other.priority);
+        }
+    }
+
+
+
 }
