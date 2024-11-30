@@ -10,6 +10,8 @@ import org.jsoup.select.Elements;
 import org.springframework.stereotype.Service;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.*;
@@ -17,14 +19,14 @@ import java.util.concurrent.*;
 @Service
 public class CrawlerService {
 
-    private final ConcurrentLinkedQueue<String> urlQueue;
+    private final PriorityBlockingQueue<String> urlQueue;
     private final Set<String> visitedUrls;
     private final ExecutorService executorService;
     private static final Logger logger = LogManager.getLogger(WebcrawlerApplication.class);
     private final Semaphore semaphore;
 
     public CrawlerService() {
-        urlQueue = new ConcurrentLinkedQueue<>();
+        urlQueue = new PriorityBlockingQueue<>(11,new UrlComparator());
         visitedUrls = ConcurrentHashMap.newKeySet();
         executorService = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors());
         semaphore = new Semaphore(Runtime.getRuntime().availableProcessors());
@@ -32,29 +34,34 @@ public class CrawlerService {
 
     public void crawl(List<String> urls) {
         urlQueue.addAll(urls);
-        while (!urlQueue.isEmpty()) {
-            String currentUrl = urlQueue.poll();
-            if (currentUrl == null || visitedUrls.contains(currentUrl)) {
-                continue;
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
+        do {
+            while (!urlQueue.isEmpty()) {
+                String currentUrl = urlQueue.poll();
+                if (currentUrl == null || visitedUrls.contains(currentUrl)) {
+                    continue;
+                }
+                visitedUrls.add(currentUrl);
+                try {
+                    semaphore.acquire();
+                    futures.add(CompletableFuture.runAsync(() -> {
+                        try {
+                            processUrl(currentUrl);
+                        } finally {
+                            semaphore.release();
+                        }
+                    }, executorService).exceptionally(ex -> {
+                        logger.error("Error processing URL: " + currentUrl, ex);
+                        return null;
+                    }));
+                } catch (InterruptedException e) {
+                    logger.error("Interrupted while acquiring semaphore", e);
+                    Thread.currentThread().interrupt();
+                }
             }
-            visitedUrls.add(currentUrl);
-            try {
-                semaphore.acquire();
-                CompletableFuture.runAsync(() -> {
-                    try {
-                        processUrl(currentUrl);
-                    } finally {
-                        semaphore.release();
-                    }
-                }, executorService).exceptionally(ex -> {
-                    logger.error("Error processing URL: " + currentUrl, ex);
-                    return null;
-                });
-            } catch (InterruptedException e) {
-                logger.error("Interrupted while acquiring semaphore", e);
-                Thread.currentThread().interrupt();
-            }
-        }
+        } while (!futures.stream().allMatch(CompletableFuture::isDone) || !urlQueue.isEmpty());
+        CompletableFuture<Void> allOf = CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]));
+        allOf.join();
         executorService.shutdown();
         try {
             executorService.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS);
@@ -63,7 +70,6 @@ public class CrawlerService {
             Thread.currentThread().interrupt();
         }
     }
-
     private void processUrl(String url) {
         try {
             Document doc = Jsoup.connect(url).get();
@@ -89,52 +95,33 @@ public class CrawlerService {
             return false;
         }
 
-        if (url.contains("javascript:") || url.contains(".onion") || url.startsWith("tel:")) {
-            return false;
-        }
-
-        return true;
+        return !url.contains("javascript:") && !url.contains(".onion") && !url.startsWith("tel:");
     }
 
-    private int calculatePriority(String url) {
-        int priority = 0;
 
-        // Higher priority for main domains
-        if (url.contains("metmuseum.org") || url.contains("nps.gov") || url.contains("mfa.org")) {
-            priority += 10;
+    private static class UrlComparator implements Comparator<String> {
+
+        private int calculatePriority(String url) {
+            int priority = 0;
+
+            if (url.contains("metmuseum.org") || url.contains("nps.gov") || url.contains("mfa.org")) {
+                priority += 10;
+            }
+
+            // Higher priority for specific content types
+            if (url.contains("/exhibitions/") || url.contains("/collections/") || url.contains("/education/")) {
+                priority += 5;
+            }
+
+            // Higher priority for URLs closer to the root
+            int depth = url.split("/").length;
+            priority += (10 - depth);
+
+            return priority;
         }
-
-        // Higher priority for specific content types
-        if (url.contains("/exhibitions/") || url.contains("/collections/") || url.contains("/education/")) {
-            priority += 5;
-        }
-
-        // Higher priority for URLs closer to the root
-        int depth = url.split("/").length;
-        priority += (10 - depth);
-
-        return priority;
-    }
-
-    private static class UrlPriority implements Comparable<UrlPriority> {
-        private final String url;
-        private final int priority;
-
-        public UrlPriority(String url, int priority) {
-            this.url = url;
-            this.priority = priority;
-        }
-
-        public String getUrl() {
-            return url;
-        }
-
         @Override
-        public int compareTo(UrlPriority other) {
-            return Integer.compare(this.priority, other.priority);
+        public int compare(String url1, String url2) {
+            return calculatePriority(url2) - calculatePriority(url1);
         }
     }
-
-
-
 }
