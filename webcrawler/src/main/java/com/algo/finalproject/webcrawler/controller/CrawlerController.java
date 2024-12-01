@@ -5,6 +5,7 @@ import lombok.AllArgsConstructor;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.springframework.data.neo4j.core.Neo4jClient;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
@@ -19,8 +20,9 @@ public class CrawlerController {
     private final Neo4jClient neo4jClient;
 
     @PostMapping("/start")
-    public void crawl(@RequestBody List<String> urls) {
-        crawlerService.crawl(urls);
+    public ResponseEntity<Void> crawl(@RequestBody List<String> urls) {
+        crawlerService.startCrawling(urls);
+        return ResponseEntity.status(202).build();
     }
 
     @GetMapping("/checkDatabase")
@@ -33,5 +35,9 @@ public class CrawlerController {
             logger.error("Failed to connect to Neo4j database.", e);
             return false;
         }
+    }
+    @GetMapping("/status")
+    public boolean getStatus() {
+        return crawlerService.isCrawlInProgress();
     }
 }
