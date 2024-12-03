@@ -8,6 +8,7 @@ import org.jsoup.Jsoup;
 import org.jsoup.nodes.Document;
 import org.jsoup.nodes.Element;
 import org.jsoup.select.Elements;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.neo4j.core.Neo4jClient;
 import org.springframework.stereotype.Service;
 
@@ -21,71 +22,108 @@ import java.util.concurrent.*;
 @Service
 public class CrawlerService {
 
-    private final PriorityBlockingQueue<String> urlQueue;
+    private static final Logger logger = LogManager.getLogger(WebcrawlerApplication.class);
+    private final PriorityBlockingQueue<UrlDepthPair> urlQueue;
     private final Set<String> visitedUrls;
     private final ExecutorService executorService;
-    private final ScheduledExecutorService scheduler;
-
-    private static final Logger logger = LogManager.getLogger(WebcrawlerApplication.class);
     private final Semaphore semaphore;
+    private final Neo4jClient neo4jClient;
+    private final PageRankingService pageRankingService;
+    private int maxDepth;
     @Getter
     private volatile boolean crawlInProgress = false;
     private volatile boolean stopCrawl = true;
-    private final Neo4jClient neo4jClient;
 
-    private final PageRankingService pageRankingService;
-
+    @Autowired
     public CrawlerService(Neo4jClient neo4jClient, PageRankingService pageRankingService) {
-        urlQueue = new PriorityBlockingQueue<>(11,new UrlComparator());
-        visitedUrls = ConcurrentHashMap.newKeySet();
-        executorService = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors());
-        scheduler = Executors.newScheduledThreadPool(1);
-        semaphore = new Semaphore(Runtime.getRuntime().availableProcessors());
+        this.urlQueue = new PriorityBlockingQueue<>(11, new UrlComparator());
+        this.visitedUrls = ConcurrentHashMap.newKeySet();
+        this.executorService = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors());
+        this.semaphore = new Semaphore(Runtime.getRuntime().availableProcessors());
         this.neo4jClient = neo4jClient;
         this.pageRankingService = pageRankingService;
+        this.maxDepth = 3;
+
     }
-    public void startCrawling(List<String> urls) {
+
+    public CrawlerService(Neo4jClient neo4jClient, PageRankingService pageRankingService, int maxDepth) {
+        this.urlQueue = new PriorityBlockingQueue<>(11, new UrlComparator());
+        this.visitedUrls = ConcurrentHashMap.newKeySet();
+        this.executorService = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors());
+        this.semaphore = new Semaphore(Runtime.getRuntime().availableProcessors());
+        this.neo4jClient = neo4jClient;
+        this.pageRankingService = pageRankingService;
+        this.maxDepth = maxDepth;
+    }
+
+
+    public void startCrawling(List<String> urls, int maxDepth) {
         if (crawlInProgress) {
             logger.info("Crawl already in progress");
             return;
         }
+        this.maxDepth = maxDepth;
         crawlInProgress = true;
         stopCrawl = false;
+
         logger.info("Starting crawl with URLs: " + urls);
-        CompletableFuture.runAsync(() -> crawl(urls));
+        clean();
+        logger.info("Starting crawl at time: " + System.currentTimeMillis());
+        initCrawl(urls);
+        List<UrlDepthPair> initialUrls = urls.stream().map(url -> new UrlDepthPair(url, 1)).toList();
+        urlQueue.addAll(initialUrls);
+        CompletableFuture.runAsync(this::crawl);
     }
 
-    private void crawl(List<String> urls) {
-        urlQueue.addAll(urls);
-        List<CompletableFuture<Void>> futures = new ArrayList<>();
+    private void clean() {
+        String cypherQuery = """
+                MATCH (n) DETACH DELETE n;
+                """;
+        neo4jClient.query(cypherQuery)
+                .run();
+        logger.info("Cleaned Neo4j database");
+    }
 
-        // Schedule a task to stop the crawling process after n minutes
-        CompletableFuture<Void> timeoutFuture = new CompletableFuture<>();
-        scheduler.schedule(() -> {
-            logger.info("Stopping crawl after 30 minutes");
-            timeoutFuture.completeExceptionally(new TimeoutException("Operation timed out"));
-            crawlInProgress = false;
-            stopCrawl = true;
-//            executorService.shutdownNow();
-        }, 1, TimeUnit.MINUTES);
+    private void initCrawl(List<String> urls) {
+        float initialPageRank = 1;
+        String cypherQuery = """
+                  MERGE (u1:Page {url: $currentUrl})
+                  SET u1.pageRank = $initialPageRank
+                """;
+        for (String url : urls) {
+            neo4jClient.query(cypherQuery)
+                    .bind(url).to("currentUrl")
+                    .bind(initialPageRank).to("initialPageRank")
+                    .run();
+        }
+    }
+
+    private void crawl() {
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
 
         do {
             while (!urlQueue.isEmpty() && crawlInProgress) {
-                String currentUrl = urlQueue.poll();
-                if (currentUrl == null || visitedUrls.contains(currentUrl)) {
+                UrlDepthPair current = urlQueue.poll();
+                if (current == null || visitedUrls.contains(current.url)) {
                     continue;
                 }
-                visitedUrls.add(currentUrl);
+
+                // Skip URLs exceeding max depth
+                if (current.depth >= maxDepth) {
+                    continue;
+                }
+
+                visitedUrls.add(current.url);
                 try {
                     semaphore.acquire();
                     futures.add(CompletableFuture.runAsync(() -> {
                         try {
-                            processUrl(currentUrl);
+                            processUrl(current.url, current.depth + 1);
                         } finally {
                             semaphore.release();
                         }
                     }, executorService).exceptionally(ex -> {
-                        logger.error("Error processing URL: " + currentUrl, ex);
+                        logger.error("Error processing URL: " + current.url, ex);
                         return null;
                     }));
                 } catch (InterruptedException e) {
@@ -94,34 +132,21 @@ public class CrawlerService {
                 }
             }
         } while (!futures.stream().allMatch(CompletableFuture::isDone) || !urlQueue.isEmpty());
-
-        CompletableFuture<Void> allOf = CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]));
-
-        // Combine the original future with the timeout future
-        CompletableFuture<Void> combinedFuture = CompletableFuture.anyOf(allOf, timeoutFuture)
-                .thenApply(result -> null);
-
-        try {
-            combinedFuture.get();
-        } catch (InterruptedException | ExecutionException e) {
-            logger.error("Error during crawling", e);
-        } finally {
-            scheduler.shutdown();
-        }
+        logger.info("Crawl completed at time: " + System.currentTimeMillis());
         crawlInProgress = false;
     }
-    private void processUrl(String url) {
+
+    private void processUrl(String url, int nextDepth) {
         try {
-            Document doc = Jsoup.connect(url).get();
-            Elements links = doc.select("a[href]");
-            for (Element link : links) {
-                String absUrl = link.absUrl("href");
-                if (isValidUrl(absUrl)) {
-                    // Check if the crawl should be stopped before adding the URL to the queue
-                    if(!stopCrawl) {
-                        urlQueue.offer(absUrl);
-                        logger.info("Added URL to queue: " + absUrl);
-                    }
+            Document doc = Jsoup.connect(url)
+                    .timeout(10000).get();
+            List<String> extractedLinks = extractLinks(doc);
+
+            for (String absUrl : extractedLinks) {
+                if (isValidUrl(absUrl) && !stopCrawl) {
+                    urlQueue.offer(new UrlDepthPair(absUrl, nextDepth));
+                    logger.info("Added URL to queue: " + absUrl + " with depth: " + nextDepth);
+
                     try {
                         insertUrlToNeo4j(url, absUrl);
                         pageRankingService.updatePageRank(absUrl);
@@ -135,51 +160,61 @@ public class CrawlerService {
         }
     }
 
-    private boolean isValidUrl(String url) {
-        if (url.isEmpty() || visitedUrls.contains(url)) {
-            return false;
+    private List<String> extractLinks(Document doc) {
+        List<String> links = new ArrayList<>();
+        Elements elements = doc.select("a[href]");
+        for (Element link : elements) {
+            links.add(link.absUrl("href"));
         }
-
-        if (!url.startsWith("https://")) {
-            return false;
-        }
-
-        return !url.contains("javascript:") && !url.contains(".onion") && !url.startsWith("tel:");
+        return links;
     }
+
+    private boolean isValidUrl(String url) {
+        return !url.isEmpty() && !visitedUrls.contains(url) && url.startsWith("https://")
+                && !url.contains("javascript:") && !url.contains(".onion") && !url.startsWith("tel:");
+    }
+
     private void insertUrlToNeo4j(String currentUrl, String linkedUrl) {
-        String cypherQuery = "MERGE (u1:Url {address: $currentUrl}) " +
-                "MERGE (u2:Url {address: $linkedUrl}) " +
-                "MERGE (u1)-[:LINKS_TO]->(u2)";
+        String cypherQuery = """
+                MERGE (u1:Page {url: $currentUrl})
+                MERGE (u2:Page {url: $linkedUrl})
+                MERGE (u1)-[:LINKS_TO]->(u2)
+                """;
         neo4jClient.query(cypherQuery)
                 .bind(currentUrl).to("currentUrl")
                 .bind(linkedUrl).to("linkedUrl")
                 .run();
-        logger.info("Inserted URL into Neo4j and created relationship: " + currentUrl + " -> " + linkedUrl);
+        logger.info("Inserted URL into Neo4j and created relationship: {} -> {}", currentUrl, linkedUrl);
     }
 
-    private static class UrlComparator implements Comparator<String> {
+
+    private static class UrlDepthPair {
+        final String url;
+        final int depth;
+
+        UrlDepthPair(String url, int depth) {
+            this.url = url;
+            this.depth = depth;
+        }
+    }
+
+    private static class UrlComparator implements Comparator<UrlDepthPair> {
+        @Override
+        public int compare(UrlDepthPair u1, UrlDepthPair u2) {
+            return calculatePriority(u2.url) - calculatePriority(u1.url);
+        }
 
         private int calculatePriority(String url) {
             int priority = 0;
-
             if (url.contains("metmuseum.org") || url.contains("nps.gov") || url.contains("mfa.org")) {
                 priority += 10;
             }
-
-            // Higher priority for specific content types
-            if (url.contains("/exhibitions/") || url.contains("/collections/") || url.contains("/education/")) {
+            if (url.contains("/exhibitions/") || url.contains("/collections/")) {
                 priority += 5;
             }
-
-            // Higher priority for URLs closer to the root
             int depth = url.split("/").length;
             priority += (10 - depth);
-
             return priority;
-        }
-        @Override
-        public int compare(String url1, String url2) {
-            return calculatePriority(url2) - calculatePriority(url1);
         }
     }
 }
