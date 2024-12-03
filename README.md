@@ -1,5 +1,4 @@
 
-
 # Web Crawler
 
 ## Introduction
@@ -61,4 +60,3 @@ For any questions or inquiries, please contact:
 - chakola.j@northeastern.edu
 - zheng.jiey@northeastern.edu
 
-You can now update the `README.md` file in your repository with this revised content.
